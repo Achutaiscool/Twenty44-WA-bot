@@ -1,0 +1,4 @@
+# Hide environment secrets
+.env
+.env.local
+.env
