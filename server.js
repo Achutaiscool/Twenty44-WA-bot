@@ -1,32 +1,37 @@
 // server.js
-import dotenv from "dotenv";
-dotenv.config(); // MUST run first
-
 import express from "express";
+import dotenv from "dotenv";
+dotenv.config();
 import mongoose from "mongoose";
-import whatsAppRouter from "./routes/whatsapp.js";
+import bodyParser from "body-parser";
+import whatsappRoutes from "./routes/whatsApp.js";
+import razorpayWebhookRoutes from "./routes/razorpayWebhook.js";
+app.use("/razorpay", razorpayWebhookRoutes);
+
 
 const app = express();
-app.use(express.json());
+app.use(bodyParser.json());
 
-// quick debug: print whether critical envs are loaded (remove in production)
-console.log("ENV: ACCESS_TOKEN loaded?", !!process.env.ACCESS_TOKEN);
-console.log("ENV: PHONE_NUMBER_ID loaded?", !!process.env.PHONE_NUMBER_ID);
-console.log("ENV: GOOGLE_REFRESH_TOKEN loaded?", !!process.env.GOOGLE_REFRESH_TOKEN);
-console.log("ENV: MONGO_URI loaded?", !!process.env.MONGO_URI);
+// health check
+app.get("/", (req, res) => res.send("🏓 Booking bot running!"));
 
-if (process.env.MONGO_URI) {
-  mongoose
-    .connect(process.env.MONGO_URI, { autoIndex: true })
-    .then(() => console.log("✅ MongoDB connected"))
-    .catch((err) => console.error("Mongo connect error:", err.message));
+app.use("/whatsapp", whatsappRoutes);
+
+// Build Mongo URI using components (safe for special chars)
+const DB_USER = process.env.DB_USER;
+const DB_PASS = encodeURIComponent(process.env.DB_PASS || "");
+const DB_CLUSTER = process.env.DB_CLUSTER;
+const DB_NAME = process.env.DB_NAME || "booking_bot";
+
+if (!DB_USER || !DB_PASS || !DB_CLUSTER) {
+  console.warn("⚠️ Missing DB env vars. Please set DB_USER, DB_PASS, DB_CLUSTER in .env");
 } else {
-  console.warn("⚠️ MONGO_URI not set — running without DB (Booking persistence disabled)");
+  const uri = `mongodb+srv://${DB_USER}:${DB_PASS}@${DB_CLUSTER}/${DB_NAME}?retryWrites=true&w=majority`;
+  mongoose
+    .connect(uri)
+    .then(() => console.log(`✅ MongoDB connected to database: ${DB_NAME}`))
+    .catch((err) => console.error("❌ MongoDB connection error:", err));
 }
 
-app.use("/webhook", whatsAppRouter);
-
-app.get("/", (req, res) => res.send("WhatsApp Booking Bot running 🚀"));
-
-const PORT = parseInt(process.env.PORT || "5000", 10);
-app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));

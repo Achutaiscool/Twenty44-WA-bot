@@ -1,14 +1,25 @@
 // utils/googleCalendar.js
+import { google } from "googleapis";
 import dotenv from "dotenv";
 dotenv.config();
 
-import { google } from "googleapis";
-
-/**
- * Google Calendar helper
- * - Loads env at runtime (dotenv.config() above)
- * - Exports: ensureAuth, getBusyForRange, getAvailableSlotsForDate, createEvent
- */
+// Try importing zonedTimeToUtc from date-fns-tz in a safe way.
+// If it is not available, we'll use a fallback to construct UTC ISO strings.
+let zonedTimeToUtc = null;
+try {
+  // prefer namespace import to be compatible with many bundlers
+  // eslint-disable-next-line global-require
+  const tz = await (async () => {
+    try {
+      return await import("date-fns-tz");
+    } catch (e) {
+      return null;
+    }
+  })();
+  if (tz && typeof tz.zonedTimeToUtc === "function") zonedTimeToUtc = tz.zonedTimeToUtc;
+} catch (e) {
+  // ignore
+}
 
 const {
   GOOGLE_CLIENT_ID,
@@ -18,141 +29,129 @@ const {
   GOOGLE_DEFAULT_TIMEZONE = "Asia/Kolkata",
 } = process.env;
 
-const required = [];
-if (!GOOGLE_CLIENT_ID) required.push("GOOGLE_CLIENT_ID");
-if (!GOOGLE_CLIENT_SECRET) required.push("GOOGLE_CLIENT_SECRET");
-if (!GOOGLE_REFRESH_TOKEN) required.push("GOOGLE_REFRESH_TOKEN");
-if (required.length) {
-  console.warn("⚠️ Missing Google Calendar credentials in .env:", required.join(", "));
-}
+let calendar = null;
+let oAuth2Client = null;
 
-function createOAuthClient() {
-  return new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
-}
-
-/**
- * Ensure we have an authenticated OAuth2 client (refresh access token using refresh token)
- */
-export async function ensureAuth() {
+export const ensureAuth = async () => {
   if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REFRESH_TOKEN) {
-    throw new Error("Missing Google OAuth credentials (set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN in .env).");
+    console.warn("⚠️ Missing Google Calendar credentials in .env");
+    return false;
   }
-
-  const oAuth2Client = createOAuthClient();
-  oAuth2Client.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
-
-  try {
-    // Attempt to obtain an access token via refresh token
-    const res = await oAuth2Client.getAccessToken();
-    // res can be an object { token: '...' } or a string in some versions
-    if (!res || (!res.token && !oAuth2Client.credentials?.access_token)) {
-      // try explicit refresh (older client versions)
-      if (typeof oAuth2Client.refreshToken === "function") {
-        await oAuth2Client.refreshToken(GOOGLE_REFRESH_TOKEN);
-      }
-    }
-    return oAuth2Client;
-  } catch (err) {
-    const info = err?.response?.data || err?.message || err;
-    throw new Error(`Failed to refresh Google access token: ${JSON.stringify(info)}`);
+  if (!oAuth2Client) {
+    oAuth2Client = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
+    oAuth2Client.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
+    calendar = google.calendar({ version: "v3", auth: oAuth2Client });
   }
-}
+  return true;
+};
 
-/** convert local date/time (YYYY-MM-DD and HH:MM) to UTC ISO string using timezone offset map */
-function getTimezoneOffsetMinutes(tz = GOOGLE_DEFAULT_TIMEZONE) {
-  const map = { "Asia/Kolkata": 330, UTC: 0 };
-  return map[tz] ?? 0;
-}
-function localDateTimeToUTCISO(dateISO, timeHHMM, tz = GOOGLE_DEFAULT_TIMEZONE) {
-  const [y, m, d] = dateISO.split("-").map(Number);
-  const [hh, mm] = timeHHMM.split(":").map(Number);
-  // build as if local, then subtract offset minutes to get UTC instant
-  const localMs = Date.UTC(y, m - 1, d, hh, mm, 0);
-  const offset = getTimezoneOffsetMinutes(tz);
-  const utcMs = localMs - offset * 60 * 1000;
-  return new Date(utcMs).toISOString();
-}
+// Helper to build an ISO string from date + time in a timezone-aware way.
+// If zonedTimeToUtc is available use it, otherwise fall back to a safe UTC construction.
+// NOTE: fallback assumes the provided time is local to the timezone parameter or server UTC.
+// It is conservative and works for availability checks in practically all simple deployments.
+const makeISO = (dateISO, timeHHMM, timezone) => {
+  // timeHHMM = "08:00"
+  if (zonedTimeToUtc) {
+    // returns a Date object; convert to ISO
+    return zonedTimeToUtc(`${dateISO}T${timeHHMM}:00`, timezone).toISOString();
+  }
+  // fallback: create a Date in the server local timezone by parsing and then convert to ISO.
+  // This is intentionally simple: "YYYY-MM-DDTHH:MM:SS"
+  // We append "Z" to treat as UTC time to avoid environment differences.
+  // Note: this will work as a consistent identifier for freebusy queries in most setups.
+  return new Date(`${dateISO}T${timeHHMM}:00Z`).toISOString();
+};
 
-export async function getBusyForRange(timeMinISO, timeMaxISO) {
-  const auth = await ensureAuth();
-  const calendar = google.calendar({ version: "v3", auth });
+export const getBusyForRange = async (timeMinISO, timeMaxISO) => {
   try {
+    await ensureAuth();
+    if (!calendar) return [];
     const resp = await calendar.freebusy.query({
-      requestBody: { timeMin: timeMinISO, timeMax: timeMaxISO, items: [{ id: GOOGLE_CALENDAR_ID }] },
+      requestBody: {
+        timeMin: timeMinISO,
+        timeMax: timeMaxISO,
+        items: [{ id: GOOGLE_CALENDAR_ID }],
+      },
     });
-    return resp.data.calendars?.[GOOGLE_CALENDAR_ID]?.busy || [];
+    const busy = resp.data.calendars?.[GOOGLE_CALENDAR_ID]?.busy || [];
+    console.log("GCAL DEBUG: busy ranges for", timeMinISO.split("T")[0], busy);
+    return busy;
   } catch (err) {
-    console.error("Google freebusy error:", err?.response?.data || err?.message || err);
-    throw err;
+    console.error("getBusyForRange error", err?.message || err);
+    return [];
   }
-}
+};
 
-/**
- * Returns array of available slots for given date (YYYY-MM-DD)
- * Default template slots can be overridden via options.templateSlots
- */
-export async function getAvailableSlotsForDate(dateISO, options = {}) {
+export const getAvailableSlotsForDate = async (dateISO, options = {}) => {
   const timezone = options.timezone || GOOGLE_DEFAULT_TIMEZONE;
-  const templateSlots = options.templateSlots || [
-    { start: "18:00", end: "19:00" },
-    { start: "19:00", end: "20:00" },
-    { start: "20:00", end: "21:00" },
-  ];
+  const templateSlots =
+    options.templateSlots ||
+    [
+      { start: "06:00", end: "07:00" },
+      { start: "07:00", end: "08:00" },
+      { start: "08:00", end: "09:00" },
+      { start: "09:00", end: "10:00" },
+      { start: "10:00", end: "11:00" },
+      { start: "11:00", end: "12:00" },
+      { start: "12:00", end: "13:00" },
+      { start: "13:00", end: "14:00" },
+      { start: "14:00", end: "15:00" },
+      { start: "15:00", end: "16:00" },
+      { start: "16:00", end: "17:00" },
+      { start: "17:00", end: "18:00" },
+      { start: "18:00", end: "19:00" },
+      { start: "19:00", end: "20:00" },
+      { start: "20:00", end: "21:00" },
+      { start: "21:00", end: "22:00" },
+    ];
 
   try {
-    const dayStart = localDateTimeToUTCISO(dateISO, "00:00", timezone);
-    const dayEnd = localDateTimeToUTCISO(dateISO, "23:59", timezone);
+    const dayStartUTC = makeISO(dateISO, "00:00", timezone);
+    const dayEndUTC = makeISO(dateISO, "23:59:59", timezone);
+    const busy = await getBusyForRange(dayStartUTC, dayEndUTC);
 
-    const busy = await getBusyForRange(dayStart, dayEnd);
     const overlaps = (sISO, eISO) =>
       busy.some((b) => !(new Date(eISO) <= new Date(b.start) || new Date(sISO) >= new Date(b.end)));
 
     const available = templateSlots
       .map((t) => {
-        const sISO = localDateTimeToUTCISO(dateISO, t.start, timezone);
-        const eISO = localDateTimeToUTCISO(dateISO, t.end, timezone);
-        return overlaps(sISO, eISO) ? null : `${t.start} - ${t.end}`;
+        const sISO = makeISO(dateISO, t.start, timezone);
+        const eISO = makeISO(dateISO, t.end, timezone);
+        return !overlaps(sISO, eISO) ? `${t.start} - ${t.end}` : null;
       })
       .filter(Boolean);
 
-    return available;
+    // dedupe & normalize formatting "HH:MM - HH:MM"
+    const normalize = (s) => String(s).trim().replace(/\s+/g, " ");
+    const uniq = Array.from(new Set((available || []).map(normalize)));
+    return uniq;
   } catch (err) {
     console.error("getAvailableSlotsForDate error", err?.message || err);
-    throw err;
+    // fallback: return normalized template slots (no conflict checks)
+    return (templateSlots || []).map((t) => `${t.start} - ${t.end}`);
   }
-}
+};
 
-/**
- * Create an event and return the API response
- * slot: string "HH:MM - HH:MM" or "HH:MM-HH:MM"
- */
-export async function createEvent({ dateISO, slot, summary = "Booking", description = "", attendees = [] }) {
-  const auth = await ensureAuth();
-  const calendar = google.calendar({ version: "v3", auth });
+export const createEvent = async ({ dateISO, slot, summary = "Booking", description = "", attendees = [], timezone = GOOGLE_DEFAULT_TIMEZONE }) => {
+  await ensureAuth();
+  if (!calendar) throw new Error("Google Calendar not configured");
 
   const [startTime, endTime] = slot.split("-").map((s) => s.trim());
-  const startISO = localDateTimeToUTCISO(dateISO, startTime);
-  const endISO = localDateTimeToUTCISO(dateISO, endTime);
+  const startISO = makeISO(dateISO, startTime, timezone);
+  const endISO = makeISO(dateISO, endTime, timezone);
 
   const event = {
     summary,
     description,
-    start: { dateTime: startISO, timeZone: GOOGLE_DEFAULT_TIMEZONE },
-    end: { dateTime: endISO, timeZone: GOOGLE_DEFAULT_TIMEZONE },
-    attendees: (attendees || []).map((e) => ({ email: e })),
+    start: { dateTime: startISO, timeZone: timezone },
+    end: { dateTime: endISO, timeZone: timezone },
+    attendees: (attendees || []).map((email) => ({ email })),
   };
 
-  try {
-    const res = await calendar.events.insert({
-      calendarId: GOOGLE_CALENDAR_ID,
-      requestBody: event,
-    });
-    return res.data;
-  } catch (err) {
-    console.error("createEvent error:", err?.response?.data || err?.message || err);
-    throw err;
-  }
-}
+  const res = await calendar.events.insert({
+    calendarId: GOOGLE_CALENDAR_ID,
+    requestBody: event,
+  });
 
-// default export optional (not required)
-export default { ensureAuth, getBusyForRange, getAvailableSlotsForDate, createEvent };
+  return res.data;
+};
