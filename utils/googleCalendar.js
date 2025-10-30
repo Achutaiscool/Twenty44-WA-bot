@@ -106,6 +106,28 @@ export const getAvailableSlotsForDate = async (dateISO, options = {}) => {
     ];
 
   try {
+    // 1. Fetch relevant context for filtering
+    const centre = options.centre || null;
+    const sport = options.sport || null;
+    // Import Booking dynamically here to avoid circular dependency
+    let Booking = null;
+    try { Booking = (await import("../models/Booking.js")).default; } catch { Booking = null; }
+
+    // 2. Mongo: get all paid bookings for this centre/date (optionally, sport)
+    let bookedSlots = [];
+    if (Booking && centre) {
+      // Hard Normalization
+      function normalizeSlotString(s) {
+        return String(s || "").replace(/[\u2013\u2014]/g, "-").replace(/-/g, " - ")
+          .replace(/\s+-\s+/g, " - ").replace(/\s+/g, " ").trim();
+      }
+      // Query to block **any** booking for given slot
+      const query = { date: dateISO, centre };
+      if (sport) query.sport = sport;
+      const bookings = await Booking.find(query).select("time_slot");
+      bookedSlots = bookings.map(b => normalizeSlotString(b.time_slot)).filter(Boolean);
+    }
+
     const dayStartUTC = makeISO(dateISO, "00:00", timezone);
     const dayEndUTC = makeISO(dateISO, "23:59:59", timezone);
     const busy = await getBusyForRange(dayStartUTC, dayEndUTC);
@@ -115,11 +137,21 @@ export const getAvailableSlotsForDate = async (dateISO, options = {}) => {
 
     const available = templateSlots
       .map((t) => {
+        const label = normalizeSlotString(`${t.start} - ${t.end}`);
+        if (!/^(\d{2}:\d{2}) - (\d{2}:\d{2})$/.test(label)) {
+          console.warn("Malformed slot time label (template):", label);
+          return null;
+        }
         const sISO = makeISO(dateISO, t.start, timezone);
         const eISO = makeISO(dateISO, t.end, timezone);
-        return !overlaps(sISO, eISO) ? `${t.start} - ${t.end}` : null;
+        const isSlotFree = !overlaps(sISO, eISO) && !bookedSlots.includes(label);
+        return isSlotFree ? label : null;
       })
       .filter(Boolean);
+
+    // Log for debugging — ensure the intersection is always empty
+    console.log("[getAvailableSlotsForDate] Booked:", bookedSlots);
+    console.log("[getAvailableSlotsForDate] Returned:", available);
 
     // dedupe & normalize formatting "HH:MM - HH:MM"
     const normalize = (s) => String(s).trim().replace(/\s+/g, " ");

@@ -1,15 +1,17 @@
 // routes/whatsApp.js
+
 import express from "express";
 import Booking from "../models/Booking.js";
 import { sendMessage, sendButtonsMessage, sendListMessage } from "../utils/whatsapp.js";
 import { getAvailableSlotsForDate, createEvent, ensureAuth } from "../utils/googleCalendar.js";
 import { formatUserDate } from "../utils/dateHelpers.js";
 import dotenv from "dotenv";
+import { createPaymentLink } from "../utils/payments.js";
 dotenv.config();
 
 const router = express.Router();
 
-// webhook verification
+// verification
 router.get("/", (req, res) => {
   const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
   const mode = req.query["hub.mode"];
@@ -22,7 +24,6 @@ router.get("/", (req, res) => {
   res.sendStatus(403);
 });
 
-// main webhook handler
 router.post("/", async (req, res) => {
   try {
     const entry = req.body.entry?.[0];
@@ -30,7 +31,7 @@ router.post("/", async (req, res) => {
     const message = changes?.messages?.[0];
     if (!message) return res.sendStatus(200);
 
-    // ---- EARLY FILTER: ignore non-message webhooks ----
+    // early filter
     const messageId = message?.id || null;
     const interactiveRaw = message?.interactive || null;
     const hasButton = !!interactiveRaw?.button_reply;
@@ -38,7 +39,6 @@ router.post("/", async (req, res) => {
     const hasText = !!message?.text?.body;
     if (!hasButton && !hasList && !hasText) return res.sendStatus(200);
 
-    // ----- robust parsing of interactive replies -----
     const incomingText = message.text?.body?.trim();
     const interactive = interactiveRaw || {};
     if (interactive && Object.keys(interactive).length) console.log("DEBUG incoming interactive payload:", interactive);
@@ -46,7 +46,6 @@ router.post("/", async (req, res) => {
     const buttonReply = interactive?.button_reply || null;
     const listReply = interactive?.list_reply || null;
 
-    // prefer ids first then titles then plain text
     const buttonReplyId = buttonReply?.id ?? null;
     const buttonReplyTitle = buttonReply?.title ?? null;
     const listReplyId = listReply?.id ?? null;
@@ -57,30 +56,41 @@ router.post("/", async (req, res) => {
     const msgLower = msg.toLowerCase();
     const from = message.from;
 
-    // get or create booking
     let booking = await Booking.findOne({ phone: from });
     if (!booking) {
-      booking = await Booking.findOneAndUpdate(
-        { phone: from },
-        { phone: from, step: "sport_selection", meta: {} },
-        { upsert: true, new: true }
-      );
+      booking = await Booking.findOneAndUpdate({ phone: from }, { phone: from, step: "sport_selection", meta: {} }, { upsert: true, new: true });
       await sendButtonsMessage(from, "🏓 Welcome to Sports Booking Bot!\nLet's get started. Which sport would you like to play?", [
         { id: "sport_pickleball", title: "Pickleball" },
         { id: "sport_padel", title: "Padel" },
       ]);
       return res.sendStatus(200);
     }
+    router.post("/notify", async (req, res) => {
+try {
+const { phone, text } = req.body;
+if (!phone || !text) {
+console.warn("⚠️ Missing phone or text in /whatsapp/notify request");
+return res.status(400).json({ error: "Missing phone or text" });
+}
 
-    // --- dedupe duplicate webhook deliveries using WhatsApp message.id ---
+
+console.log("📨 /whatsapp/notify received:", { phone, text });
+await sendMessage(phone, text);
+return res.status(200).json({ success: true, message: "WhatsApp message sent" });
+} catch (err) {
+console.error("🔥 Error in /whatsapp/notify:", err.message);
+return res.status(500).json({ error: "Failed to send message" });
+}
+});
+
+    // dedupe by messageId
     if (messageId) {
       booking.meta = booking.meta || {};
       if (booking.meta.lastMessageId && booking.meta.lastMessageId === messageId) {
-        console.log("DEBUG: duplicate webhook delivery ignored, messageId:", messageId);
+        console.log("DEBUG: duplicate webhook ignored", messageId);
         return res.sendStatus(200);
       }
       booking.meta.lastMessageId = messageId;
-      // persist quickly so other deliveries of same id skip
       await Booking.findOneAndUpdate({ phone: from }, { $set: { "meta.lastMessageId": messageId } }, { new: true, upsert: false });
     }
 
@@ -91,7 +101,6 @@ router.post("/", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // helper normalizers
     const normalizeSlot = (s) => String(s || "").replace(/\s+/g, " ").replace(/–|—|−/g, "-").trim();
     const extractTimes = (slotStr) => {
       const m = String(slotStr || "").match(/(\d{1,2}:\d{2}).*?(\d{1,2}:\d{2})/);
@@ -99,9 +108,8 @@ router.post("/", async (req, res) => {
       return { start: m[1].padStart(5, "0"), end: m[2].padStart(5, "0") };
     };
 
-    // ROUTE FLOW
+    // flow
     switch (booking.step) {
-      /* 1. SPORT */
       case "sport_selection": {
         if (msg === "sport_pickleball" || msg === "sport_padel" || msgLower.includes("pickle") || msgLower.includes("padel")) {
           booking.sport = msg === "sport_padel" || msgLower.includes("padel") ? "Padel" : "Pickleball";
@@ -118,7 +126,6 @@ router.post("/", async (req, res) => {
         break;
       }
 
-      /* 2. CENTRE */
       case "centre_selection": {
         if (["centre_jw", "centre_taj", "centre_itc"].includes(msg)) {
           booking.centre = msg === "centre_jw" ? "JW Marriott" : msg === "centre_taj" ? "Taj West End" : "ITC Gardenia";
@@ -135,7 +142,6 @@ router.post("/", async (req, res) => {
         break;
       }
 
-      /* 3. DATE SELECTION */
       case "date_selection": {
         if (msg === "date_today") {
           const todayIso = new Date().toISOString().slice(0, 10);
@@ -237,12 +243,9 @@ router.post("/", async (req, res) => {
         break;
       }
 
-      /* 4. TIME SELECTION (robust dedupe + slotMap for list replies) */
       case "time_selection": {
-        // Debug: log current booking.meta
         console.log("DEBUG booking.meta before time_selection:", booking.meta || null);
 
-        // 1) If user chooses a time-of-day button
         if (["tod_morning", "tod_afternoon", "tod_evening"].includes(msg)) {
           let templateSlots = [];
           if (msg === "tod_morning") {
@@ -260,7 +263,6 @@ router.post("/", async (req, res) => {
             templateSlots = ["17:00 - 18:00", "18:00 - 19:00", "19:00 - 20:00", "20:00 - 21:00", "21:00 - 22:00"];
           }
 
-          // fetch availability
           let slotsAvail = [];
           try {
             slotsAvail = await getAvailableSlotsForDate(booking.date);
@@ -273,14 +275,11 @@ router.post("/", async (req, res) => {
           console.log("DEBUG: templateSlots:", templateSlots);
           console.log("DEBUG: slotsAvail (raw):", slotsAvail);
 
-          // Normalize and dedupe availability
           const normalizedAvail = slotsAvail.map(normalizeSlot);
-          const uniqAvail = Array.from(new Set(normalizedAvail)); // dedupe
+          const uniqAvail = Array.from(new Set(normalizedAvail));
 
-          // First try intersection with template
           let available = templateSlots.filter((t) => uniqAvail.includes(normalizeSlot(t)));
 
-          // fallback: match by extracted times
           if (!available.length && uniqAvail.length) {
             const availRanges = uniqAvail.map(extractTimes).filter(Boolean);
             if (availRanges.length) {
@@ -292,9 +291,7 @@ router.post("/", async (req, res) => {
             }
           }
 
-          // If TOD had no slots but day has other slots, show day slots (deduped)
           if (!available.length && uniqAvail.length) {
-            // build slotMap and currentSlots
             const slotMap = {};
             const currentSlots = [];
             uniqAvail.forEach((s, i) => {
@@ -303,7 +300,6 @@ router.post("/", async (req, res) => {
               currentSlots.push(s);
             });
 
-            // persist using findOneAndUpdate so other requests see it immediately
             booking = await Booking.findOneAndUpdate(
               { phone: from },
               { $set: { "meta.slotMap": slotMap, "meta.currentSlots": currentSlots } },
@@ -320,7 +316,6 @@ router.post("/", async (req, res) => {
             return res.sendStatus(200);
           }
 
-          // If still no available slots at all that day
           if (!available.length) {
             await sendMessage(from, "Sorry, no available slots in that time of day. Please pick another time or date.");
             await sendButtonsMessage(from, "Choose time of day:", [
@@ -331,7 +326,6 @@ router.post("/", async (req, res) => {
             return res.sendStatus(200);
           }
 
-          // Build unique slot map for the template-matched slots
           booking.meta = booking.meta || {};
           booking.meta.slotMap = {};
           booking.meta.currentSlots = [];
@@ -342,7 +336,6 @@ router.post("/", async (req, res) => {
             booking.meta.currentSlots.push(s);
           });
 
-          // persist the template-matched slotMap to DB as well
           booking = await Booking.findOneAndUpdate(
             { phone: from },
             { $set: { "meta.slotMap": booking.meta.slotMap, "meta.currentSlots": booking.meta.currentSlots } },
@@ -351,7 +344,6 @@ router.post("/", async (req, res) => {
 
           console.log("DEBUG saved template slotMap to DB:", booking?.meta?.slotMap);
 
-          // Send as buttons if <=3 else as list
           if (booking.meta.currentSlots.length <= 3) {
             const btns = Object.entries(booking.meta.slotMap).map(([id, title]) => ({ id, title }));
             await sendButtonsMessage(from, `Available time slots for ${formatUserDate(booking.date)}:`, btns);
@@ -362,9 +354,7 @@ router.post("/", async (req, res) => {
           return res.sendStatus(200);
         }
 
-        // 2) user selected a slot -> resolve robustly using slotMap and other fallbacks
-
-        // Before resolving, re-fetch booking from DB to pick up any saved slotMap
+        // user selected a slot
         booking = await Booking.findOne({ phone: from });
         console.log("DEBUG booking reloaded for resolution:", booking?.meta);
 
@@ -373,25 +363,17 @@ router.post("/", async (req, res) => {
         console.log("DEBUG booking.meta.currentSlots:", booking?.meta?.currentSlots);
 
         let chosen = null;
-
-        // 1) exact id lookup (slot_1) using saved slotMap
         if (booking?.meta?.slotMap && booking.meta.slotMap[msg]) {
           chosen = booking.meta.slotMap[msg];
           console.log("DEBUG matched by slotMap id =>", chosen);
-        }
-        // 2) maybe user replied with numeric index (1-based)
-        else if (/^\d+$/.test(msg) && booking?.meta?.currentSlots) {
+        } else if (/^\d+$/.test(msg) && booking?.meta?.currentSlots) {
           const idx = Number(msg) - 1;
           chosen = booking.meta.currentSlots?.[idx];
           console.log("DEBUG matched by numeric index =>", chosen);
-        }
-        // 3) exact title match
-        else if (booking?.meta?.currentSlots?.includes(msg)) {
+        } else if (booking?.meta?.currentSlots?.includes(msg)) {
           chosen = msg;
           console.log("DEBUG matched by exact title =>", chosen);
-        }
-        // 4) normalized/fuzzy match
-        else {
+        } else {
           const normMsg = normalizeSlot(msg).toLowerCase();
           chosen = (booking?.meta?.currentSlots || []).find((c) => normalizeSlot(c).toLowerCase() === normMsg) || null;
           console.log("DEBUG matched by normalized =>", chosen);
@@ -402,7 +384,7 @@ router.post("/", async (req, res) => {
           return res.sendStatus(200);
         }
 
-        // final availability check (re-query calendar)
+        // final availability check
         let slotsNow = [];
         try {
           slotsNow = await getAvailableSlotsForDate(booking.date);
@@ -415,7 +397,6 @@ router.post("/", async (req, res) => {
         const normalizedNow = Array.from(new Set(slotsNow.map(normalizeSlot)));
         if (!normalizedNow.includes(normalizeSlot(chosen))) {
           await sendMessage(from, "❌ Sorry that slot was just taken. Please pick another slot.");
-          // refresh currentSlots and slotMap to intersection
           booking.meta.currentSlots = (booking.meta.currentSlots || []).filter((s) => normalizedNow.includes(normalizeSlot(s)));
           booking.meta.slotMap = {};
           booking.meta.currentSlots.forEach((s, i) => (booking.meta.slotMap[`slot_${i}`] = s));
@@ -423,7 +404,7 @@ router.post("/", async (req, res) => {
           return res.sendStatus(200);
         }
 
-        // success: set time_slot and move forward
+        // set slot and proceed to players
         booking.time_slot = chosen;
         booking.step = "player_count";
         await booking.save();
@@ -438,7 +419,6 @@ router.post("/", async (req, res) => {
         return res.sendStatus(200);
       }
 
-      /* 5. PLAYER COUNT */
       case "player_count": {
         if (["players_2", "players_3", "players_4"].includes(msg) || /^\d+$/.test(msg)) {
           const num = msg.startsWith("players_") ? Number(msg.split("_")[1]) : Number(msg);
@@ -453,29 +433,26 @@ router.post("/", async (req, res) => {
         break;
       }
 
-      /* 6. ADDONS */
       case "addons_selection": {
-        if (/^[1-4]$/.test(msg)) {
-          const map = { "1": "spa", "2": "gym", "3": "sauna", "4": "none" };
-          const choice = map[msg];
-          booking.addons = choice === "none" ? [] : [choice];
-          let total = 0;
-          total += (booking.players || 1) * 300;
-          if (booking.addons.includes("spa")) total += 2000;
-          if (booking.addons.includes("gym")) total += 500;
-          if (booking.addons.includes("sauna")) total += 800;
-          booking.totalAmount = total;
-          booking.step = "collect_contact";
-          await booking.save();
+  if (/^[1-4]$/.test(msg)) {
+    const map = { "1": "spa", "2": "gym", "3": "sauna", "4": "none" };
+    const choice = map[msg];
+    booking.addons = choice === "none" ? [] : [choice];
 
-          await sendMessage(from, `Please provide your full name:`);
-        } else {
-          await sendMessage(from, "Please reply 1,2,3 or 4 to choose add-ons.");
-        }
-        break;
-      }
+    // 💰 Always set total to ₹1
+    booking.totalAmount = 1;
 
-      /* 7. COLLECT CONTACT (name) */
+    booking.step = "collect_contact";
+    await booking.save();
+
+    await sendMessage(from, "Please provide your full name:");
+  } else {
+    await sendMessage(from, "Please reply 1, 2, 3 or 4 to choose add-ons.");
+  }
+  break;
+}
+
+
       case "collect_contact": {
         if (!msg || msg.length < 2) {
           await sendMessage(from, "Please provide a valid full name.");
@@ -484,59 +461,27 @@ router.post("/", async (req, res) => {
           booking.step = "payment";
           await booking.save();
 
-          const paymentLink = `https://example-payments.local/pay?ref=${booking._id}`;
-          await sendMessage(from, `Please complete your payment using this link:\n\n${paymentLink}`);
-          await sendMessage(from, `Final Booking Summary:\n\n• Sport: ${booking.sport}\n• Center: ${booking.centre}\n• Date: ${formatUserDate(booking.date)}\n• Time: ${booking.time_slot}\n• Players: ${booking.players}\n• Add-ons: ${booking.addons.length ? booking.addons.join(", ") : "None"}\n• Total Amount: ₹${booking.totalAmount}\n\nPress 'Done' when payment completed.`);
-
-          await sendMessage(from, "Please complete payment using this link. We'll confirm automatically once payment is received.");
-
+          // create razorpay payment link and send to user
+          try {
+            const link = await createPaymentLink(booking, booking.totalAmount || 0);
+            await sendMessage(from, `Please complete your payment using this link:\n\n${link}\n\nWe'll confirm automatically when payment is received.`);
+            // do not show Done/Cancel buttons anymore
+          } catch (err) {
+            console.error("Failed to create payment link:", err?.message || err);
+            await sendMessage(from, "Sorry, we couldn't create a payment link right now. Try again later or type 'Cancel' to abort.");
+          }
         }
         break;
       }
 
-      /* 8. PAYMENT & CONFIRMATION */
       case "payment": {
-        if (msg === "payment_done" || msgLower === "paid" || msgLower === "done") {
-          const available = await getAvailableSlotsForDate(booking.date);
-          if (!available.includes(booking.time_slot)) {
-            await sendMessage(from, "Sorry, the slot was taken before payment completed. Please choose another slot.");
-            booking.step = "date_selection";
-            await booking.save();
-            await sendButtonsMessage(from, "Pick a new date:", [
-              { id: "date_this_week", title: "This Week" },
-              { id: "date_other", title: "Other Dates" },
-            ]);
-            return res.sendStatus(200);
-          }
-
-          try {
-            await ensureAuth();
-            const event = await createEvent({
-              dateISO: booking.date,
-              slot: booking.time_slot,
-              summary: `${booking.sport} booking - ${booking.name}`,
-              description: `Booked by ${booking.name} (${booking.phone})`,
-            });
-            booking.calendarEventId = event?.id;
-          } catch (err) {
-            console.warn("Warning: Google Calendar event not created:", err?.message || err);
-          }
-
-          booking.paid = true;
-          booking.step = "completed";
-          await booking.save();
-
-          await sendMessage(from, `✅ Booking Confirmed!\n\nSport: ${booking.sport}\nCenter: ${booking.centre}\nDate: ${formatUserDate(booking.date)}\nTime: ${booking.time_slot}\nPlayers: ${booking.players}\nAdd-ons: ${booking.addons.length ? booking.addons.join(", ") : "None"}\nTotal: ₹${booking.totalAmount}\n\nThank you — we'll see you then!`);
-        } else if (msg === "payment_cancel" || msgLower === "cancel") {
-          await Booking.deleteOne({ phone: from });
-          await sendMessage(from, "❌ Booking cancelled. Type '1' to start again.");
-        } else {
-          await sendMessage(from, "Press 'Done' after payment or 'Cancel' to abort.");
-        }
+        // because we auto-confirm via webhook, this step can be minimal
+        await sendMessage(from, "We confirm payments automatically — no action needed. If you've already paid, wait a moment for confirmation.");
         break;
       }
 
       default:
+        // reset flow
         await Booking.findOneAndUpdate({ phone: from }, { $set: { step: "sport_selection" } }, { new: true, upsert: false });
         await sendButtonsMessage(from, "🏓 Welcome back! Which sport would you like to play?", [
           { id: "sport_pickleball", title: "Pickleball" },
@@ -545,7 +490,6 @@ router.post("/", async (req, res) => {
         break;
     }
 
-    // persist any last-minute changes
     await booking.save().catch(() => {});
     return res.sendStatus(200);
   } catch (err) {

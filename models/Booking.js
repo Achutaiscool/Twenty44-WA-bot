@@ -22,6 +22,8 @@ const bookingSchema = new mongoose.Schema(
 
 // ensure index on phone (non-unique)
 bookingSchema.index({ phone: 1 });
+// NEW: Ensure a slot can only ever have at most one booking, globally per slot+centre+date+sport
+bookingSchema.index({ centre: 1, sport: 1, date: 1, time_slot: 1 }, { unique: true });
 
 const Booking = mongoose.models.Booking || mongoose.model("Booking", bookingSchema);
 export default Booking;

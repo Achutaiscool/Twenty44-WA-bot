@@ -1,153 +1,123 @@
-// routes/razorpayWebhook.js
+// FILE: routes/razorpayWebhook.js
 import express from "express";
-import rawBody from "raw-body";
 import crypto from "crypto";
-import dotenv from "dotenv";
-import Booking from "../models/Booking.js";
+import axios from "axios";
 import { sendMessage } from "../utils/whatsapp.js";
-import { createEvent, ensureAuth } from "../utils/googleCalendar.js";
+import Booking from "../models/Booking.js";
 import { formatUserDate } from "../utils/dateHelpers.js";
+import { normalizeSlotString } from "../utils/normalizeSlot.js";
 
-dotenv.config();
 const router = express.Router();
 
-const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET || "";
+// Razorpay webhook secret from .env
+const RAZORPAY_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET || "replace_with_your_secret";
 
-const verifySignature = (rawBodyString, signatureHeader, secret) => {
-  const expected = crypto.createHmac("sha256", secret).update(rawBodyString).digest("hex");
-  return expected === signatureHeader;
-};
+// ✅ Health check route
+router.get("/webhook", (req, res) => {
+  res.status(200).send("✅ Razorpay webhook endpoint is active (POST only)");
+});
 
-/**
- * Webhook endpoint (POST /razorpay/webhook)
- * Configure this URL in Razorpay dashboard and set the same secret.
- */
+function computeSignatures(rawBody, secret) {
+  if (!rawBody) return { hex: null, base64: null };
+  const hex = crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
+  const base64 = crypto.createHmac("sha256", secret).update(rawBody).digest("base64");
+  return { hex, base64 };
+}
+
+function safeCompare(a, b) {
+  try {
+    const ab = Buffer.from(a || "", "utf8");
+    const bb = Buffer.from(b || "", "utf8");
+    if (ab.length !== bb.length) return false;
+    return crypto.timingSafeEqual(ab, bb);
+  } catch {
+    return false;
+  }
+}
+
+// ✅ Razorpay webhook handler
 router.post("/webhook", async (req, res) => {
   try {
-    // read raw body for correct signature verification
-    const buf = await rawBody(req);
-    const bodyStr = buf.toString();
-    const signature = (req.headers["x-razorpay-signature"] || "").toString();
+    const signature = (req.headers["x-razorpay-signature"] || "").trim();
+    const { hex, base64 } = computeSignatures(req.rawBody, RAZORPAY_SECRET);
 
-    if (!verifySignature(bodyStr, signature, RAZORPAY_WEBHOOK_SECRET)) {
-      console.warn("Razorpay webhook signature mismatch");
-      return res.status(400).send("invalid signature");
+    const verified = safeCompare(signature, hex) || safeCompare(signature, base64);
+    if (!verified) {
+      console.warn("❌ Invalid Razorpay signature", { signature, hex, base64 });
+      return res.status(400).send("Invalid signature");
     }
 
-    const payload = JSON.parse(bodyStr);
-    const event = payload.event;
-    console.log("Razorpay webhook event:", event);
+    console.log("✅ Razorpay webhook verified");
+    console.log("Payload:", req.body);
 
-    // --- handle payment link paid event (payment_link.paid) ---
-    if (event === "payment_link.paid" || event === "payment_link.paid_and_credited") {
-      const linkEntity = payload.payload?.payment_link?.entity;
-      const referenceId = linkEntity?.reference_id; // you should set this to booking._id when creating link
-      const linkId = linkEntity?.id;
-      const paymentId = payload.payload?.payment?.entity?.id || null;
+    const event = req.body.event;
+    const payload = req.body.payload || {};
 
-      if (!referenceId) {
-        console.warn("No reference_id on payment link event — cannot map to booking.");
-        return res.status(200).send({ ok: true });
+    const successEvents = ["payment.captured", "order.paid", "payment_link.paid"];
+    if (successEvents.includes(event)) {
+      // Try to identify the booking related to the payment
+      let booking = null;
+      let foundBy = null;
+      let bookingId = null;
+      if (payload.payment_link?.entity?.reference_id) {
+        bookingId = payload.payment_link.entity.reference_id;
+        booking = await Booking.findById(bookingId);
+        foundBy = 'payment_link.reference_id';
+      } else if (payload.payment?.entity?.notes?.bookingId) {
+        bookingId = payload.payment.entity.notes.bookingId;
+        booking = await Booking.findById(bookingId);
+        foundBy = 'payment.entity.notes.bookingId';
+      } else if (payload.payment?.entity?.order_id) {
+        booking = await Booking.findOne({ "meta.razorpay.orderId": payload.payment.entity.order_id });
+        foundBy = 'meta.razorpay.orderId';
       }
-
-      // Mark booking paid & completed and save razorpay meta
-      const booking = await Booking.findByIdAndUpdate(
-        referenceId,
-        {
-          $set: {
-            paid: true,
-            step: "completed",
-            "meta.razorpay.paymentLink": linkEntity,
-            "meta.razorpay.lastPaymentId": paymentId || null,
-            "meta.razorpay.paymentLinkId": linkId || null,
-          },
-        },
-        { new: true }
-      );
-
       if (!booking) {
-        console.warn("Booking not found for reference_id:", referenceId);
-        return res.status(200).send({ ok: true });
+        console.warn(`No booking found to mark as paid for payment event. Lookup method: ${foundBy}`);
+        return res.status(200).send({ ok: false, msg: "Booking not found" });
       }
-
-      // Optionally create a Google Calendar event (if calendar configured)
-      try {
-        await ensureAuth();
-        const eventRes = await createEvent({
-          dateISO: booking.date,
-          slot: booking.time_slot,
-          summary: `${booking.sport} booking - ${booking.name || booking.phone}`,
-          description: `Booked by ${booking.name || booking.phone}`,
-        });
-        booking.calendarEventId = eventRes?.id;
+      if (booking.paid) {
+        console.log(`Booking already marked as paid (id: ${booking._id}). No action taken.`);
+        return res.status(200).send({ ok: true, alreadyPaid: true });
+      }
+      // Check for booking conflicts before allowing confirmation
+      const conflict = await Booking.findOne({
+        centre: booking.centre,
+        date: booking.date,
+        time_slot: normalizeSlotString(booking.time_slot),
+        paid: true,
+        _id: { $ne: booking._id },
+      });
+      if (conflict) {
+        booking.step = "conflict";
         await booking.save();
-      } catch (err) {
-        console.warn("Calendar event not created (non-fatal):", err?.message || err);
+        try {
+          await sendMessage(booking.phone, `⚠️ Sorry, this slot was just booked by someone else and is no longer available. Please choose another.`);
+        } catch (err) {
+          console.error("⚠️ Failed to send WhatsApp conflict warning:", err.message || err);
+        }
+        console.warn(`Booking conflict: cannot confirm ${booking._id} because of existing paid booking for slot (${booking.centre}, ${booking.date}, ${booking.time_slot})`);
+        return res.status(200).send({ ok: false, conflict: true });
       }
-
-      // Send WhatsApp confirmation automatically
+      // Mark booking as paid & completed and message only once
+      booking.paid = true;
+      booking.step = "completed";
+      await booking.save();
       const phone = booking.phone;
-      const text = `✅ Payment received — Booking Confirmed!\n\nSport: ${booking.sport}\nCenter: ${booking.centre}\nDate: ${formatUserDate(booking.date)}\nTime: ${booking.time_slot}\nPlayers: ${booking.players || "-"}\nAdd-ons: ${booking.addons?.length ? booking.addons.join(", ") : "None"}\nTotal: ₹${booking.totalAmount || 0}\n\nThank you!`;
+      const text = `✅ Booking Confirmed!\n\nSport: ${booking.sport}\nCenter: ${booking.centre}\nDate: ${formatUserDate(booking.date)}\nTime: ${booking.time_slot}\nPlayers: ${booking.players || "-"}\nTotal: ₹${booking.totalAmount || 0}\n\nThank you!`;
       try {
         await sendMessage(phone, text);
-        console.log("Sent confirmation message to", phone);
+        console.log("📩 Booking confirmation sent successfully");
       } catch (err) {
-        console.warn("Failed to send WhatsApp confirmation:", err?.message || err);
+        console.error("⚠️ Failed to send WhatsApp confirmation:", err.message || err);
       }
-
       return res.status(200).send({ ok: true });
     }
 
-    // --- handle payment captured/paid events for orders/payments if you use Orders API ---
-    if (event === "payment.captured" || event === "payment.authorized" || event === "order.paid") {
-      // try to locate booking by order id or payment notes or meta saved earlier
-      const paymentEntity = payload.payload?.payment?.entity || null;
-      const orderId = paymentEntity?.order_id || payload.payload?.order?.entity?.id || null;
-      const paymentId = paymentEntity?.id || null;
-
-      // Try to find booking by orderId or payment link id stored earlier in meta
-      let booking = null;
-      if (orderId) booking = await Booking.findOne({ "meta.razorpay.orderId": orderId });
-      if (!booking && paymentEntity?.notes?.bookingId) booking = await Booking.findById(paymentEntity.notes.bookingId);
-
-      if (booking) {
-        booking.paid = true;
-        booking.step = "completed";
-        booking.meta = booking.meta || {};
-        booking.meta.razorpay = booking.meta.razorpay || {};
-        booking.meta.razorpay.lastPayment = paymentEntity;
-        await booking.save();
-
-        // create calendar event & send WA confirmation (same as above)
-        try {
-          await ensureAuth();
-          const eventRes = await createEvent({
-            dateISO: booking.date,
-            slot: booking.time_slot,
-            summary: `${booking.sport} booking - ${booking.name || booking.phone}`,
-            description: `Booked by ${booking.name || booking.phone}`,
-          });
-          booking.calendarEventId = eventRes?.id;
-          await booking.save();
-        } catch (err) {}
-
-        try {
-          await sendMessage(booking.phone, `✅ Payment received — Booking Confirmed!\n\nSport: ${booking.sport}\nCenter: ${booking.centre}\nDate: ${formatUserDate(booking.date)}\nTime: ${booking.time_slot}\nTotal: ₹${booking.totalAmount || 0}`);
-        } catch (err) {
-          console.warn("Failed to send confirmation message:", err?.message || err);
-        }
-      } else {
-        console.log("No booking found for payment/order event (orderId/payment notes):", orderId, paymentEntity?.notes);
-      }
-
-      return res.status(200).send({ ok: true });
-    }
-
-    // For other events - acknowledge
-    res.status(200).send({ ok: true });
+    // Always respond quickly to Razorpay
+    return res.status(200).send("Webhook processed");
   } catch (err) {
-    console.error("Razorpay webhook processing error:", err);
-    return res.status(500).send("error");
+    console.error("🔥 Webhook processing error:", err);
+    return res.status(500).send("Server error");
   }
 });
 
