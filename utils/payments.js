@@ -18,13 +18,14 @@ const razor = new Razorpay({
 
 /**
  * Create Razorpay payment link and persist meta on booking.
- * amount in rupees (default 1 for testing).
+ * amount in rupees (default 1 — checkout set to ₹1).
  */
 export async function createPaymentLink(booking, amount = 1) {
   try {
     if (!booking || !booking._id) throw new Error("Booking required to create payment link");
 
-    const amountPaise = Math.max(1, Number(amount)) * 100;
+  // Ensure minimum checkout amount is 1 rupee. Convert rupees -> paise
+  const amountPaise = Math.max(1, Number(amount)) * 100;
 
     const opts = {
       amount: amountPaise,

@@ -164,6 +164,69 @@ export const getAvailableSlotsForDate = async (dateISO, options = {}) => {
   }
 };
 
+// Get available time slots for a specific date
+export const getAvailableSlots = async (dateISO, timezone = GOOGLE_DEFAULT_TIMEZONE) => {
+  if (!(await ensureAuth())) {
+    throw new Error('Google Calendar authentication failed');
+  }
+
+  try {
+    const startOfDay = new Date(dateISO);
+    startOfDay.setHours(0, 0, 0, 0);
+    
+    const endOfDay = new Date(dateISO);
+    endOfDay.setHours(23, 59, 59, 999);
+
+    // Get busy slots from calendar
+    const response = await calendar.freebusy.query({
+      requestBody: {
+        timeMin: startOfDay.toISOString(),
+        timeMax: endOfDay.toISOString(),
+        timeZone: timezone,
+        items: [{ id: GOOGLE_CALENDAR_ID }],
+      },
+    });
+
+    // Generate available slots (1-hour slots from 6 AM to 10 PM)
+    const slots = [];
+    const startHour = 6;
+    const endHour = 22; // 10 PM
+
+    for (let hour = startHour; hour < endHour; hour++) {
+      const slotStart = new Date(startOfDay);
+      slotStart.setHours(hour, 0, 0, 0);
+      
+      const slotEnd = new Date(slotStart);
+      slotEnd.setHours(hour + 1, 0, 0, 0);
+      
+      // Check if this slot is available
+      const isBusy = response.data.calendars[GOOGLE_CALENDAR_ID].busy.some(busy => {
+        const busyStart = new Date(busy.start);
+        const busyEnd = new Date(busy.end);
+        return !(slotStart >= busyEnd || slotEnd <= busyStart);
+      });
+
+      if (!isBusy) {
+        // Format time with leading zeros
+        const startTimeStr = hour.toString().padStart(2, '0') + ':00';
+        const endTimeStr = (hour + 1).toString().padStart(2, '0') + ':00';
+        
+        slots.push({
+          start: slotStart,
+          end: slotEnd,
+          formatted: `${startTimeStr} - ${endTimeStr}`
+        });
+      }
+    }
+
+    return slots;
+  } catch (error) {
+    console.error('Error getting available slots:', error);
+    throw new Error('Failed to fetch available time slots');
+  }
+};
+
+// Create a new calendar event
 export const createEvent = async ({ dateISO, slot, summary = "Booking", description = "", attendees = [], timezone = GOOGLE_DEFAULT_TIMEZONE }) => {
   await ensureAuth();
   if (!calendar) throw new Error("Google Calendar not configured");

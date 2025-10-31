@@ -2,500 +2,671 @@
 
 import express from "express";
 import Booking from "../models/Booking.js";
-import { sendMessage, sendButtonsMessage, sendListMessage } from "../utils/whatsapp.js";
-import { getAvailableSlotsForDate, createEvent, ensureAuth } from "../utils/googleCalendar.js";
-import { formatUserDate } from "../utils/dateHelpers.js";
-import dotenv from "dotenv";
+import { sendMessage, sendButtonsMessage, sendListMessage, sendUrlButtonMessage } from "../utils/whatsapp.js";
+import { getAvailableSlots, createEvent } from "../utils/googleCalendar.js";
 import { createPaymentLink } from "../utils/payments.js";
+import dotenv from "dotenv";
 dotenv.config();
 
 const router = express.Router();
 
-// verification
+// Helper function to check if a slot is available in DB
+const isSlotAvailable = async (centre, sport, date, timeSlot) => {
+  try {
+    const existing = await Booking.findOne({
+      centre,
+      sport,
+      date,
+      time_slot: timeSlot,
+    });
+    return !existing; // true if available, false if taken
+  } catch (err) {
+    console.error("Error checking slot availability:", err);
+    return false; // Fail safe - assume not available if error
+  }
+};
+
+// Verification endpoint for webhook
 router.get("/", (req, res) => {
   const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
+  
   if (mode && token === VERIFY_TOKEN) {
     console.log("Webhook verified");
     return res.status(200).send(challenge);
   }
+  console.error("Webhook verification failed");
   res.sendStatus(403);
 });
 
+// Main webhook handler
 router.post("/", async (req, res) => {
+  console.log('=== NEW WEBHOOK REQUEST ===');
+  
   try {
+    // Extract message details
     const entry = req.body.entry?.[0];
     const changes = entry?.changes?.[0]?.value;
     const message = changes?.messages?.[0];
-    if (!message) return res.sendStatus(200);
+    
+    if (!message) {
+      console.log('No message found in webhook');
+      return res.sendStatus(200);
+    }
 
-    // early filter
-    const messageId = message?.id || null;
-    const interactiveRaw = message?.interactive || null;
-    const hasButton = !!interactiveRaw?.button_reply;
-    const hasList = !!interactiveRaw?.list_reply;
-    const hasText = !!message?.text?.body;
-    if (!hasButton && !hasList && !hasText) return res.sendStatus(200);
-
-    const incomingText = message.text?.body?.trim();
-    const interactive = interactiveRaw || {};
-    if (interactive && Object.keys(interactive).length) console.log("DEBUG incoming interactive payload:", interactive);
-
+    // Process message
+    const messageId = message?.id;
+    const interactive = message?.interactive || {};
     const buttonReply = interactive?.button_reply || null;
     const listReply = interactive?.list_reply || null;
-
-    const buttonReplyId = buttonReply?.id ?? null;
-    const buttonReplyTitle = buttonReply?.title ?? null;
-    const listReplyId = listReply?.id ?? null;
-    const listReplyTitle = listReply?.title ?? null;
-
-    const msgRaw = listReplyId || buttonReplyId || listReplyTitle || buttonReplyTitle || incomingText || "";
-    const msg = String(msgRaw || "").trim();
+    const incomingText = message.text?.body?.trim() || '';
+    
+    // Determine the message content
+    const msgRaw = listReply?.id || buttonReply?.id || 
+                  listReply?.title || buttonReply?.title || 
+                  incomingText || "";
+    
+    const msg = String(msgRaw).trim();
     const msgLower = msg.toLowerCase();
     const from = message.from;
 
+    console.log(`Processing message from ${from}: ${msg}`)
+    console.log('Message details:', { listReply, buttonReply, incomingText });
+
+    // Find or create booking
     let booking = await Booking.findOne({ phone: from });
     if (!booking) {
-      booking = await Booking.findOneAndUpdate({ phone: from }, { phone: from, step: "sport_selection", meta: {} }, { upsert: true, new: true });
-      await sendButtonsMessage(from, "🏓 Welcome to Sports Booking Bot!\nLet's get started. Which sport would you like to play?", [
-        { id: "sport_pickleball", title: "Pickleball" },
-        { id: "sport_padel", title: "Padel" },
-      ]);
+      booking = new Booking({
+        phone: from,
+        step: 'welcome',
+        meta: {}
+      });
+      await booking.save();
+      console.log('Created new booking record:', { id: booking._id?.toString(), phone: booking.phone });
+      
+      await sendWelcomeMessage(from);
       return res.sendStatus(200);
     }
-    router.post("/notify", async (req, res) => {
-try {
-const { phone, text } = req.body;
-if (!phone || !text) {
-console.warn("⚠️ Missing phone or text in /whatsapp/notify request");
-return res.status(400).json({ error: "Missing phone or text" });
-}
 
-
-console.log("📨 /whatsapp/notify received:", { phone, text });
-await sendMessage(phone, text);
-return res.status(200).json({ success: true, message: "WhatsApp message sent" });
-} catch (err) {
-console.error("🔥 Error in /whatsapp/notify:", err.message);
-return res.status(500).json({ error: "Failed to send message" });
-}
-});
-
-    // dedupe by messageId
+    // Dedupe by messageId
     if (messageId) {
-      booking.meta = booking.meta || {};
-      if (booking.meta.lastMessageId && booking.meta.lastMessageId === messageId) {
-        console.log("DEBUG: duplicate webhook ignored", messageId);
+      if (!booking.meta) booking.meta = {};
+      if (booking.meta.lastMessageId === messageId) {
+        console.log("Duplicate webhook ignored", messageId);
         return res.sendStatus(200);
       }
       booking.meta.lastMessageId = messageId;
-      await Booking.findOneAndUpdate({ phone: from }, { $set: { "meta.lastMessageId": messageId } }, { new: true, upsert: false });
+      booking.markModified('meta');
     }
 
-    // universal exit
-    if (msgLower === "exit" || msgLower === "cancel") {
-      await Booking.deleteOne({ phone: from });
-      await sendMessage(from, "❌ Booking cancelled. Type '1' or 'Start' anytime to start again.");
+    // Handle sport selection
+    if (msg.startsWith('sport_')) {
+      const selectedSport = msg.split('_')[1];
+      if (!booking.meta) booking.meta = {};
+      booking.meta.selectedSport = selectedSport;
+      booking.step = 'selecting_location';
+      booking.markModified('meta');
+      await booking.save();
+      
+      console.log('✅ Selected sport:', selectedSport);
+      
+      // Send location selection
+      await sendLocationSelection(from);
       return res.sendStatus(200);
     }
 
-    const normalizeSlot = (s) => String(s || "").replace(/\s+/g, " ").replace(/–|—|−/g, "-").trim();
-    const extractTimes = (slotStr) => {
-      const m = String(slotStr || "").match(/(\d{1,2}:\d{2}).*?(\d{1,2}:\d{2})/);
-      if (!m) return null;
-      return { start: m[1].padStart(5, "0"), end: m[2].padStart(5, "0") };
-    };
-
-    // flow
-    switch (booking.step) {
-      case "sport_selection": {
-        if (msg === "sport_pickleball" || msg === "sport_padel" || msgLower.includes("pickle") || msgLower.includes("padel")) {
-          booking.sport = msg === "sport_padel" || msgLower.includes("padel") ? "Padel" : "Pickleball";
-          booking.step = "centre_selection";
-          await booking.save();
-          await sendButtonsMessage(from, `Great choice! You've selected ${booking.sport}.\nWhich center would you like to book at?`, [
-            { id: "centre_jw", title: "JW Marriott" },
-            { id: "centre_taj", title: "Taj West End" },
-            { id: "centre_itc", title: "ITC Gardenia" },
-          ]);
-        } else {
-          await sendMessage(from, "Please choose a sport by tapping a button (Pickleball / Padel).");
-        }
-        break;
-      }
-
-      case "centre_selection": {
-        if (["centre_jw", "centre_taj", "centre_itc"].includes(msg)) {
-          booking.centre = msg === "centre_jw" ? "JW Marriott" : msg === "centre_taj" ? "Taj West End" : "ITC Gardenia";
-          booking.step = "date_selection";
-          await booking.save();
-          await sendButtonsMessage(from, `Perfect! You've selected ${booking.centre}.\nWhen would you like to play?`, [
-            { id: "date_today", title: "Today" },
-            { id: "date_this_week", title: "This Week" },
-            { id: "date_other", title: "Other Dates" },
-          ]);
-        } else {
-          await sendMessage(from, "Please choose a center using the buttons.");
-        }
-        break;
-      }
-
-      case "date_selection": {
-        if (msg === "date_today") {
-          const todayIso = new Date().toISOString().slice(0, 10);
-          const slots = await getAvailableSlotsForDate(todayIso);
-          if (!slots || !slots.length) {
-            await sendMessage(from, "❗ Sorry, no slots available today. Please choose another option.");
-            await sendButtonsMessage(from, "Choose a date:", [
-              { id: "date_this_week", title: "This Week" },
-              { id: "date_other", title: "Other Dates" },
-            ]);
-            return res.sendStatus(200);
-          }
-          booking.date = todayIso;
-          booking.step = "time_selection";
-          booking.meta = booking.meta || {};
-          booking.meta.lastDateRows = [{ id: `date_${todayIso}`, iso: todayIso }];
-          await Booking.findOneAndUpdate({ phone: from }, { $set: { date: booking.date, step: booking.step, meta: booking.meta } }, { new: true });
-          await sendButtonsMessage(from, `Great! You've selected ${formatUserDate(todayIso)}.\nChoose time of day:`, [
-            { id: "tod_morning", title: "Morning" },
-            { id: "tod_afternoon", title: "Afternoon" },
-            { id: "tod_evening", title: "Evening" },
-          ]);
-        } else if (msg === "date_this_week") {
-          const dates = [];
-          for (let i = 0; i < 7; i++) {
-            const d = new Date();
-            d.setDate(d.getDate() + i);
-            dates.push(d.toISOString().slice(0, 10));
-          }
-          const rows = dates.slice(0, 10).map((iso) => ({ id: `date_${iso}`, title: formatUserDate(iso), description: iso }));
-          booking.meta = booking.meta || {};
-          booking.meta.lastDateRows = rows.map((r) => ({ id: r.id, iso: r.description }));
-          await Booking.findOneAndUpdate({ phone: from }, { $set: { meta: booking.meta } }, { new: true });
-          await sendListMessage(from, "Select a date this week:", [{ title: "Available dates", rows }]);
-        } else if (msg === "date_other") {
-          const now = new Date();
-          const weeks = [];
-          for (let wk = 1; wk <= 3; wk++) {
-            const start = new Date();
-            start.setDate(now.getDate() + wk * 7);
-            const label = `Week ${wk} starting ${start.toISOString().slice(0, 10)}`;
-            weeks.push({ id: `week_${wk}`, title: label, startIso: start.toISOString().slice(0, 10) });
-          }
-          booking.meta = booking.meta || {};
-          booking.meta.otherWeeks = weeks;
-          await Booking.findOneAndUpdate({ phone: from }, { $set: { meta: booking.meta } }, { new: true });
-          const buttons = weeks.map((w, i) => ({ id: w.id, title: `Week ${i + 1}` }));
-          await sendButtonsMessage(from, "Select which week (other dates):", buttons);
-        } else if (msg.startsWith("date_")) {
-          const iso = msg.replace("date_", "");
-          booking.date = iso;
-          booking.step = "time_selection";
-          await Booking.findOneAndUpdate({ phone: from }, { $set: { date: booking.date, step: booking.step } }, { new: true });
-          await sendButtonsMessage(from, `Great! You've selected ${formatUserDate(iso)}.\nChoose time of day:`, [
-            { id: "tod_morning", title: "Morning" },
-            { id: "tod_afternoon", title: "Afternoon" },
-            { id: "tod_evening", title: "Evening" },
-          ]);
-        } else if (msg.startsWith("week_")) {
-          const weekIndex = Number(msg.split("_")[1]);
-          const week = (booking.meta?.otherWeeks || [])[weekIndex - 1];
-          if (!week) {
-            await sendMessage(from, "Invalid week selection. Please pick again.");
-            return res.sendStatus(200);
-          }
-          const start = new Date(week.startIso);
-          const dayList = [];
-          for (let i = 0; i < 7; i++) {
-            const d = new Date(start);
-            d.setDate(start.getDate() + i);
-            const iso = d.toISOString().slice(0, 10);
-            dayList.push({ id: `date_${iso}`, title: formatUserDate(iso), description: iso });
-          }
-          booking.meta = booking.meta || {};
-          booking.meta.lastDateRows = dayList.map((r) => ({ id: r.id, iso: r.description }));
-          booking.step = "date_selection";
-          await Booking.findOneAndUpdate({ phone: from }, { $set: { meta: booking.meta, step: booking.step } }, { new: true });
-          await sendListMessage(from, "Select a date from the week:", [{ title: "Week dates", rows: dayList }]);
-        } else {
-          if (booking.meta?.lastDateRows && /^\d+$/.test(msg)) {
-            const idx = Number(msg) - 1;
-            const target = booking.meta.lastDateRows[idx];
-            if (target) {
-              booking.date = target.iso;
-              booking.step = "time_selection";
-              await Booking.findOneAndUpdate({ phone: from }, { $set: { date: booking.date, step: booking.step } }, { new: true });
-              await sendButtonsMessage(from, `Great! You've selected ${formatUserDate(target.iso)}.\nChoose time of day:`, [
-                { id: "tod_morning", title: "Morning" },
-                { id: "tod_afternoon", title: "Afternoon" },
-                { id: "tod_evening", title: "Evening" },
-              ]);
-            } else {
-              await sendMessage(from, "Please choose a valid option from the list.");
-            }
-          } else {
-            await sendMessage(from, "Please choose 'Today', 'This Week' or 'Other Dates' using the buttons.");
-          }
-        }
-        break;
-      }
-
-      case "time_selection": {
-        console.log("DEBUG booking.meta before time_selection:", booking.meta || null);
-
-        if (["tod_morning", "tod_afternoon", "tod_evening"].includes(msg)) {
-          let templateSlots = [];
-          if (msg === "tod_morning") {
-            templateSlots = [
-              "06:00 - 07:00",
-              "07:00 - 08:00",
-              "08:00 - 09:00",
-              "09:00 - 10:00",
-              "10:00 - 11:00",
-              "11:00 - 12:00",
-            ];
-          } else if (msg === "tod_afternoon") {
-            templateSlots = ["12:00 - 13:00", "13:00 - 14:00", "14:00 - 15:00", "15:00 - 16:00", "16:00 - 17:00"];
-          } else {
-            templateSlots = ["17:00 - 18:00", "18:00 - 19:00", "19:00 - 20:00", "20:00 - 21:00", "21:00 - 22:00"];
-          }
-
-          let slotsAvail = [];
-          try {
-            slotsAvail = await getAvailableSlotsForDate(booking.date);
-            if (!Array.isArray(slotsAvail)) slotsAvail = [];
-          } catch (err) {
-            console.warn("getAvailableSlotsForDate error:", err?.message || err);
-            slotsAvail = [];
-          }
-
-          console.log("DEBUG: templateSlots:", templateSlots);
-          console.log("DEBUG: slotsAvail (raw):", slotsAvail);
-
-          const normalizedAvail = slotsAvail.map(normalizeSlot);
-          const uniqAvail = Array.from(new Set(normalizedAvail));
-
-          let available = templateSlots.filter((t) => uniqAvail.includes(normalizeSlot(t)));
-
-          if (!available.length && uniqAvail.length) {
-            const availRanges = uniqAvail.map(extractTimes).filter(Boolean);
-            if (availRanges.length) {
-              available = templateSlots.filter((t) => {
-                const tt = extractTimes(t);
-                if (!tt) return false;
-                return availRanges.some((a) => a.start === tt.start && a.end === tt.end);
-              });
-            }
-          }
-
-          if (!available.length && uniqAvail.length) {
-            const slotMap = {};
-            const currentSlots = [];
-            uniqAvail.forEach((s, i) => {
-              const id = `slot_${i}`;
-              slotMap[id] = s;
-              currentSlots.push(s);
-            });
-
-            booking = await Booking.findOneAndUpdate(
-              { phone: from },
-              { $set: { "meta.slotMap": slotMap, "meta.currentSlots": currentSlots } },
-              { new: true, upsert: false }
-            );
-
-            console.log("DEBUG saved slotMap to DB:", booking?.meta?.slotMap);
-            console.log("DEBUG saved currentSlots to DB:", booking?.meta?.currentSlots);
-
-            await sendMessage(from, `No available slots in that time of day. Here are other slots available on ${formatUserDate(booking.date)}:`);
-
-            const rows = Object.entries(booking.meta.slotMap).map(([id, title]) => ({ id, title, description: title }));
-            await sendListMessage(from, `Available time slots for ${formatUserDate(booking.date)}:`, [{ title: "Slots", rows }]);
-            return res.sendStatus(200);
-          }
-
-          if (!available.length) {
-            await sendMessage(from, "Sorry, no available slots in that time of day. Please pick another time or date.");
-            await sendButtonsMessage(from, "Choose time of day:", [
-              { id: "tod_morning", title: "Morning" },
-              { id: "tod_afternoon", title: "Afternoon" },
-              { id: "tod_evening", title: "Evening" },
-            ]);
-            return res.sendStatus(200);
-          }
-
-          booking.meta = booking.meta || {};
-          booking.meta.slotMap = {};
-          booking.meta.currentSlots = [];
-          const uniqAvailable = Array.from(new Set(available.map(normalizeSlot)));
-          uniqAvailable.forEach((s, i) => {
-            const id = `slot_${i}`;
-            booking.meta.slotMap[id] = s;
-            booking.meta.currentSlots.push(s);
+    // Handle location selection
+    if (msg.startsWith('location_')) {
+      const selectedLocation = msg.split('_')[1];
+      if (!booking.meta) booking.meta = {};
+      booking.meta.selectedLocation = selectedLocation;
+      booking.step = 'selecting_date';
+      booking.markModified('meta');
+      await booking.save();
+      
+      console.log('✅ Selected location:', selectedLocation);
+      
+      // Get dates with available slots
+      let datesWithSlots = await getAvailableDates();
+      
+      // Fallback: if calendar check fails, show all dates
+      if (datesWithSlots.length === 0) {
+        console.warn('⚠️ Calendar API unavailable, showing all dates as fallback');
+        const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+        const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+        
+        datesWithSlots = [];
+        for (let i = 0; i < 7; i++) {
+          const date = new Date();
+          date.setDate(date.getDate() + i);
+          const dayName = days[date.getDay()];
+          const day = String(date.getDate()).padStart(2, '0');
+          const month = months[date.getMonth()];
+          const dateStr = date.toISOString().split('T')[0];
+          
+          datesWithSlots.push({
+            dateStr,
+            title: `${dayName}, ${day} ${month}`,
+            availableCount: 16 // Show estimated slots
           });
-
-          booking = await Booking.findOneAndUpdate(
-            { phone: from },
-            { $set: { "meta.slotMap": booking.meta.slotMap, "meta.currentSlots": booking.meta.currentSlots } },
-            { new: true, upsert: false }
-          );
-
-          console.log("DEBUG saved template slotMap to DB:", booking?.meta?.slotMap);
-
-          if (booking.meta.currentSlots.length <= 3) {
-            const btns = Object.entries(booking.meta.slotMap).map(([id, title]) => ({ id, title }));
-            await sendButtonsMessage(from, `Available time slots for ${formatUserDate(booking.date)}:`, btns);
-          } else {
-            const rows = Object.entries(booking.meta.slotMap).map(([id, title]) => ({ id, title, description: title }));
-            await sendListMessage(from, `Available time slots for ${formatUserDate(booking.date)}:`, [{ title: "Slots", rows }]);
-          }
-          return res.sendStatus(200);
         }
-
-        // user selected a slot
-        booking = await Booking.findOne({ phone: from });
-        console.log("DEBUG booking reloaded for resolution:", booking?.meta);
-
-        console.log("DEBUG resolving chosen, msg:", msg);
-        console.log("DEBUG booking.meta.slotMap:", booking?.meta?.slotMap);
-        console.log("DEBUG booking.meta.currentSlots:", booking?.meta?.currentSlots);
-
-        let chosen = null;
-        if (booking?.meta?.slotMap && booking.meta.slotMap[msg]) {
-          chosen = booking.meta.slotMap[msg];
-          console.log("DEBUG matched by slotMap id =>", chosen);
-        } else if (/^\d+$/.test(msg) && booking?.meta?.currentSlots) {
-          const idx = Number(msg) - 1;
-          chosen = booking.meta.currentSlots?.[idx];
-          console.log("DEBUG matched by numeric index =>", chosen);
-        } else if (booking?.meta?.currentSlots?.includes(msg)) {
-          chosen = msg;
-          console.log("DEBUG matched by exact title =>", chosen);
-        } else {
-          const normMsg = normalizeSlot(msg).toLowerCase();
-          chosen = (booking?.meta?.currentSlots || []).find((c) => normalizeSlot(c).toLowerCase() === normMsg) || null;
-          console.log("DEBUG matched by normalized =>", chosen);
-        }
-
-        if (!chosen) {
-          await sendMessage(from, "Please select a valid time slot (reply with number or tap a button).");
-          return res.sendStatus(200);
-        }
-
-        // final availability check
-        let slotsNow = [];
-        try {
-          slotsNow = await getAvailableSlotsForDate(booking.date);
-          if (!Array.isArray(slotsNow)) slotsNow = [];
-        } catch (err) {
-          console.warn("getAvailableSlotsForDate error on final check:", err?.message || err);
-          slotsNow = [];
-        }
-
-        const normalizedNow = Array.from(new Set(slotsNow.map(normalizeSlot)));
-        if (!normalizedNow.includes(normalizeSlot(chosen))) {
-          await sendMessage(from, "❌ Sorry that slot was just taken. Please pick another slot.");
-          booking.meta.currentSlots = (booking.meta.currentSlots || []).filter((s) => normalizedNow.includes(normalizeSlot(s)));
-          booking.meta.slotMap = {};
-          booking.meta.currentSlots.forEach((s, i) => (booking.meta.slotMap[`slot_${i}`] = s));
-          await Booking.findOneAndUpdate({ phone: from }, { $set: { "meta.slotMap": booking.meta.slotMap, "meta.currentSlots": booking.meta.currentSlots } });
-          return res.sendStatus(200);
-        }
-
-        // set slot and proceed to players
-        booking.time_slot = chosen;
-        booking.step = "player_count";
-        await booking.save();
-        console.log(`✅ Booking updated for ${booking.phone}: ${booking.date} ${booking.time_slot}`);
-
-        await sendButtonsMessage(from, `Perfect! You've chosen ${chosen}.\nHow many players?`, [
-          { id: "players_2", title: "2 players" },
-          { id: "players_3", title: "3 players" },
-          { id: "players_4", title: "4 players" },
-        ]);
-
-        return res.sendStatus(200);
       }
-
-      case "player_count": {
-        if (["players_2", "players_3", "players_4"].includes(msg) || /^\d+$/.test(msg)) {
-          const num = msg.startsWith("players_") ? Number(msg.split("_")[1]) : Number(msg);
-          booking.players = num;
-          booking.step = "addons_selection";
-          await booking.save();
-
-          await sendMessage(from, "Would you like to add any additional services?\n1. Spa (₹2000)\n2. Gym Access (₹500)\n3. Sauna (₹800)\n4. No thanks, proceed to payment\n\nPlease reply with the number of your choice.");
-        } else {
-          await sendMessage(from, "Please choose player count using the buttons (2/3/4) or send a number.");
-        }
-        break;
-      }
-
-      case "addons_selection": {
-  if (/^[1-4]$/.test(msg)) {
-    const map = { "1": "spa", "2": "gym", "3": "sauna", "4": "none" };
-    const choice = map[msg];
-    booking.addons = choice === "none" ? [] : [choice];
-
-    // 💰 Always set total to ₹1
-    booking.totalAmount = 1;
-
-    booking.step = "collect_contact";
-    await booking.save();
-
-    await sendMessage(from, "Please provide your full name:");
-  } else {
-    await sendMessage(from, "Please reply 1, 2, 3 or 4 to choose add-ons.");
-  }
-  break;
-}
-
-
-      case "collect_contact": {
-        if (!msg || msg.length < 2) {
-          await sendMessage(from, "Please provide a valid full name.");
-        } else {
-          booking.name = msg;
-          booking.step = "payment";
-          await booking.save();
-
-          // create razorpay payment link and send to user
-          try {
-            const link = await createPaymentLink(booking, booking.totalAmount || 0);
-            await sendMessage(from, `Please complete your payment using this link:\n\n${link}\n\nWe'll confirm automatically when payment is received.`);
-            // do not show Done/Cancel buttons anymore
-          } catch (err) {
-            console.error("Failed to create payment link:", err?.message || err);
-            await sendMessage(from, "Sorry, we couldn't create a payment link right now. Try again later or type 'Cancel' to abort.");
-          }
-        }
-        break;
-      }
-
-      case "payment": {
-        // because we auto-confirm via webhook, this step can be minimal
-        await sendMessage(from, "We confirm payments automatically — no action needed. If you've already paid, wait a moment for confirmation.");
-        break;
-      }
-
-      default:
-        // reset flow
-        await Booking.findOneAndUpdate({ phone: from }, { $set: { step: "sport_selection" } }, { new: true, upsert: false });
-        await sendButtonsMessage(from, "🏓 Welcome back! Which sport would you like to play?", [
-          { id: "sport_pickleball", title: "Pickleball" },
-          { id: "sport_padel", title: "Padel" },
-        ]);
-        break;
+      
+      // Send date selection list (shorten IDs for WhatsApp)
+      const dateRows = datesWithSlots.map((d, idx) => ({
+        id: `dt${idx}`, // Short ID format
+        title: d.title,
+        description: `${d.availableCount} slots`
+      }));
+      
+      // Store date mapping for later
+      if (!booking.meta) booking.meta = {};
+      booking.meta.dateMapping = datesWithSlots.reduce((acc, d, idx) => {
+        acc[`dt${idx}`] = d.dateStr;
+        return acc;
+      }, {});
+      booking.markModified('meta'); // Mark meta as modified for MongoDB
+      await booking.save();
+      
+      console.log('✅ Saved date mapping:', booking.meta.dateMapping);
+      
+      await sendListMessage(from, '📅 Select a Date', [{
+        title: 'Available Dates',
+        rows: dateRows
+      }]);
+      
+      return res.sendStatus(200);
     }
 
-    await booking.save().catch(() => {});
+    // Handle date selection
+    if (msg.startsWith('dt')) {
+      console.log('Date selection detected:', msg);
+      console.log('Date mapping:', booking.meta?.dateMapping);
+      
+      if (!booking.meta?.dateMapping) {
+        await sendMessage(from, '❌ Session expired. Please type "start" to begin again.');
+        return res.sendStatus(200);
+      }
+      
+      const selectedDate = booking.meta.dateMapping[msg];
+      
+      if (!selectedDate) {
+        await sendMessage(from, '❌ Invalid date selection. Please type "start" to try again.');
+        return res.sendStatus(200);
+      }
+      
+      booking.meta.selectedDate = selectedDate;
+      booking.step = 'selecting_time_period';
+      booking.markModified('meta');
+      await booking.save();
+      
+      console.log('✅ Saved selected date:', selectedDate);
+      
+      // Format date for display
+      const date = new Date(selectedDate);
+      const options = { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' };
+      const formattedDate = date.toLocaleDateString('en-US', options);
+      
+      // Store selected date for time period buttons
+      booking.meta.currentDate = selectedDate;
+      booking.markModified('meta');
+      await booking.save();
+      
+      // Send time period selection (Morning and Evening only)
+      const timePeriodButtons = [
+        {
+          id: 'period_morning',
+          title: '🌅 Morning'
+        },
+        {
+          id: 'period_evening',
+          title: '🌃 Evening'
+        }
+      ];
+      
+      await sendButtonsMessage(
+        from,
+        `⏰ Select a time period for ${formattedDate}:`,
+        timePeriodButtons
+      );
+      
+      return res.sendStatus(200);
+    }
+
+    // Handle time period selection (morning/evening)
+    if (msg.startsWith('period_')) {
+      const period = msg.replace('period_', '');
+      const selectedDate = booking.meta.currentDate;
+      
+      if (!selectedDate) {
+        await sendMessage(from, '❌ Session expired. Please type "start" to begin again.');
+        return res.sendStatus(200);
+      }
+      
+      booking.meta.selectedDate = selectedDate;
+      booking.meta.selectedPeriod = period;
+      booking.step = 'selecting_time_slot';
+      booking.markModified('meta');
+      await booking.save();
+      
+      // Define time ranges for each period
+      let startHour, endHour;
+      // We split the full day (6:00 - 22:00) into two equal periods of 8 slots each:
+      // Morning: 06:00 - 14:00 (8 one-hour slots)
+      // Evening: 14:00 - 22:00 (8 one-hour slots)
+      if (period === 'morning') {
+        startHour = 6;
+        endHour = 14;
+      } else { // evening
+        startHour = 14; // 2 PM
+        endHour = 22; // 10 PM
+      }
+      
+      // Get available slots from Google Calendar
+      let availableSlots = [];
+      try {
+        availableSlots = await getAvailableSlots(selectedDate);
+      } catch (error) {
+        console.warn('⚠️ Calendar API unavailable, generating fallback slots');
+        // Generate fallback slots if API fails
+        for (let hour = startHour; hour < endHour; hour++) {
+          const startTimeStr = hour.toString().padStart(2, '0') + ':00';
+          const endTimeStr = (hour + 1).toString().padStart(2, '0') + ':00';
+          availableSlots.push({
+            start: new Date(),
+            end: new Date(),
+            formatted: `${startTimeStr} - ${endTimeStr}`
+          });
+        }
+      }
+      
+      // Filter slots for the selected period
+      const periodSlots = availableSlots.filter(slot => {
+        const slotHour = slot.start ? slot.start.getHours() : parseInt(slot.formatted.split(':')[0]);
+        return slotHour >= startHour && slotHour < endHour;
+      });
+      
+      if (periodSlots.length === 0) {
+        await sendMessage(from, `❌ No available slots for ${period} on this date. Please choose another time period or date.`);
+        return res.sendStatus(200);
+      }
+      
+      // Generate time slot rows with short IDs
+      const slotRows = periodSlots.map((slot, idx) => ({
+        id: `sl${idx}`,
+        title: slot.formatted,
+        description: 'Available'
+      }));
+      
+      // Store slot mapping
+      booking.meta.slotMapping = periodSlots.reduce((acc, slot, idx) => {
+        acc[`sl${idx}`] = slot.formatted;
+        return acc;
+      }, {});
+      booking.markModified('meta');
+      await booking.save();
+      
+      console.log('✅ Saved slot mapping:', booking.meta.slotMapping);
+      
+      // Send time slot selection as a list
+      await sendListMessage(from, '🕒 Select a Time Slot', [{
+        title: `${period === 'morning' ? '🌅 Morning' : '🌃 Evening'} Slots`,
+        rows: slotRows
+      }]);
+      
+      return res.sendStatus(200);
+    }
+
+    // Handle cancel booking
+    if (msg === 'cancel_booking') {
+      await Booking.deleteOne({ phone: from });
+      await sendMessage(from, "❌ Booking cancelled. Type 'start' to begin a new booking.");
+      return res.sendStatus(200);
+    }
+
+    // Handle calendar/book command
+    if (msgLower === 'calendar' || msgLower === 'check calendar' || msgLower === 'book') {
+      booking.step = 'selecting_sport';
+      await booking.save();
+      
+      await sendSportSelection(from);
+      return res.sendStatus(200);
+    }
+    
+    // Handle slot selection
+    if (msg.startsWith('sl') && /^sl\d+$/.test(msg)) {
+      await handleSlotSelection(from, booking, msg);
+      return res.sendStatus(200);
+    }
+    
+    // Handle booking confirmation
+    if (msg.startsWith('confirm_')) {
+      await handleBookingConfirmation(from, booking, msg);
+      return res.sendStatus(200);
+    }
+
+    // Handle start/restart
+    if (msgLower === "start" || msgLower === "hi" || msgLower === "hello" || msgLower === "1") {
+      await Booking.deleteOne({ phone: from });
+      await sendWelcomeMessage(from);
+      return res.sendStatus(200);
+    }
+
+    // Handle exit/cancel
+    if (msgLower === "exit" || msgLower === "cancel") {
+      await Booking.deleteOne({ phone: from });
+      await sendMessage(from, "❌ Booking cancelled. Type 'start' anytime to begin again.");
+      return res.sendStatus(200);
+    }
+
+    // Fallback: Unknown command
+    await sendMessage(from, "❓ I didn't understand that. Type 'start' to begin or 'help' for assistance.");
+
+    await booking.save();
     return res.sendStatus(200);
-  } catch (err) {
-    console.error("Webhook Error:", err);
-    return res.sendStatus(500);
+    
+  } catch (error) {
+    console.error('❌ Webhook Error:', {
+      message: error.message,
+      stack: error.stack,
+      requestBody: req.body
+    });
+    
+    // Try to send error message to user
+    try {
+      const from = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.from;
+      if (from) {
+        await sendMessage(from, '❌ An error occurred. Please try again.');
+      }
+    } catch (e) {
+      console.error('Failed to send error message to user:', e);
+    }
+    
+    return res.status(500).json({
+      error: 'Internal Server Error',
+      message: error.message
+    });
   }
 });
+
+// Helper function to get dates with available slots
+const getAvailableDates = async () => {
+  const datesWithSlots = [];
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  
+  for (let i = 0; i < 7; i++) {
+    const date = new Date();
+    date.setDate(date.getDate() + i);
+    const dayName = days[date.getDay()];
+    const day = String(date.getDate()).padStart(2, '0');
+    const month = months[date.getMonth()];
+    const dateStr = date.toISOString().split('T')[0]; // YYYY-MM-DD
+    
+    try {
+      // Check if this date has any available slots
+      const slots = await getAvailableSlots(dateStr);
+      
+      if (slots.length > 0) {
+        datesWithSlots.push({
+          dateStr,
+          title: `${dayName}, ${day} ${month}`,
+          availableCount: slots.length
+        });
+      }
+    } catch (error) {
+      console.error(`Error checking availability for ${dateStr}:`, error);
+    }
+  }
+  
+  return datesWithSlots;
+};
+
+// Helper function to send sport selection
+const sendSportSelection = async (to) => {
+  const sportButtons = [
+    {
+      id: 'sport_pickleball',
+      title: '🏓 Pickleball'
+    },
+    {
+      id: 'sport_paddle',
+      title: '🎾 Paddle'
+    }
+  ];
+  
+  await sendButtonsMessage(
+    to,
+    '🏃 Welcome! Which sport would you like to play?',
+    sportButtons
+  );
+};
+
+// Helper function to send location selection
+const sendLocationSelection = async (to) => {
+  const locationButtons = [
+    {
+      id: 'location_jw',
+      title: '🏨 JW Marriott'
+    },
+    {
+      id: 'location_taj',
+      title: '🏨 Taj West End'
+    },
+    {
+      id: 'location_itc',
+      title: '🏨 ITC Gardenia'
+    }
+  ];
+  
+  await sendButtonsMessage(
+    to,
+    '📍 Select your preferred location:',
+    locationButtons
+  );
+};
+
+
+// Helper function to send welcome message with sport selection
+const sendWelcomeMessage = async (to) => {
+  await sendSportSelection(to);
+};
+
+// Handle slot selection
+async function handleSlotSelection(phone, booking, msg) {
+  try {
+    // Extract slot information from mapping
+    const timeRange = booking.meta?.slotMapping?.[msg];
+    const date = booking.meta?.selectedDate;
+    
+    if (!timeRange || !date) {
+      await sendMessage(phone, '❌ Session expired. Please type "start" to begin again.');
+      return;
+    }
+
+    // Prepare location and sport details for conflict check and DB persistence
+    const locationMap = {
+      'jw': 'JW Marriott',
+      'taj': 'Taj West End',
+      'itc': 'ITC Gardenia'
+    };
+    const sportName = booking.meta.selectedSport === 'pickleball' ? 'Pickleball' : 'Paddle';
+    const centre = locationMap[booking.meta.selectedLocation] || booking.meta.selectedLocation;
+
+    // Check if slot is available before proceeding
+    const available = await isSlotAvailable(centre, sportName, date, timeRange);
+    if (!available) {
+      await sendMessage(phone, '❌ Sorry, this slot is no longer available. Please select a different time slot.');
+      return;
+    }
+    
+    // Store selection in meta
+    booking.meta.selectedTimeSlot = timeRange;
+    booking.meta.confirmDate = date;
+    booking.meta.confirmTime = timeRange;
+    booking.markModified('meta');
+    // Prepare update payload for persistent booking record
+    const amount = booking.meta?.price || Number(process.env.DEFAULT_BOOKING_AMOUNT) || 1;
+    const updatePayload = {
+      sport: sportName,
+      centre,
+      date,
+      time_slot: timeRange,
+      totalAmount: Number(amount),
+      meta: booking.meta,
+      step: booking.step || 'payment_pending',
+    };
+
+    try {
+      console.log('Persisting booking to DB (findByIdAndUpdate)', { bookingId: booking._id?.toString(), updatePayload });
+      // Use findByIdAndUpdate to ensure DB update even if model instance is out-of-sync
+      const updated = await Booking.findByIdAndUpdate(booking._id, updatePayload, { new: true, upsert: false });
+      if (!updated) {
+        console.warn('Failed to update booking record (not found):', booking._id);
+        await sendMessage(phone, '⚠️ Could not persist booking. Please try again.');
+        return;
+      }
+      // Replace local booking object with the one from DB
+      booking = updated;
+      console.log('Persisted booking to DB:', booking._id.toString());
+    } catch (err) {
+      // Handle duplicate slot (unique index on centre+sport+date+time_slot)
+      if (err?.code === 11000) {
+        console.warn('Slot already booked while trying to persist booking:', { centre, date, timeRange });
+        await sendMessage(phone, '⚠️ Sorry, this slot was just booked by someone else. Please choose another slot or date.');
+        return;
+      }
+      console.error('Error persisting booking:', err);
+      throw err;
+    }
+
+    // Send booking summary to user before payment
+    const slotDate = new Date(date);
+    const formattedDate = slotDate.toLocaleDateString('en-US', {
+      weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
+    });
+    const summary = `📋 Booking Summary\n\nSport: ${sportName}\nLocation: ${centre}\nDate: ${formattedDate}\nTime: ${timeRange}\nAmount: ₹${booking.totalAmount}`;
+    await sendMessage(phone, summary);
+    
+    // Create a Razorpay payment link and send to the user as a tappable URL button
+    // Amount precedence: booking.meta.price -> DEFAULT_BOOKING_AMOUNT env -> 1
+    try {
+  // Use stored booking.totalAmount as authoritative amount
+  const paymentUrl = await createPaymentLink(booking, booking.totalAmount || 1);
+      if (paymentUrl) {
+        const body = `💳 Please complete payment to confirm your booking.\nAmount: ₹${amount}\nTap the button below to pay.\n\nWe'll confirm automatically after successful payment.`;
+        // Use interactive URL button when available
+        try {
+          await sendUrlButtonMessage(phone, body, paymentUrl, 'Pay Now');
+        } catch (e) {
+          // Fallback to plain URL text if interactive URL button fails
+          console.warn('URL button failed, falling back to text link:', e?.message || e);
+          await sendMessage(phone, `${body}\n${paymentUrl}\nAfter payment, tap "✅ Confirm".`);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to create/send payment link:', err?.message || err);
+      await sendMessage(phone, '⚠️ Unable to create a payment link right now. You can still confirm and we will follow up for payment.');
+    }
+    
+    // We no longer ask for manual confirmation. The webhook will auto-confirm the booking
+    // and send the final confirmation message to the user after payment is captured.
+    await sendMessage(phone, `📩 Payment sent. We'll confirm your booking automatically once payment is received.`);
+  } catch (error) {
+    console.error('Slot selection error:', error);
+    await sendMessage(phone, '❌ Failed to process your selection. Please try again.');
+  }
+}
+
+// Handle booking confirmation
+async function handleBookingConfirmation(phone, booking, msg) {
+  try {
+    if (msg === 'confirm_no') {
+      await Booking.deleteOne({ phone });
+      await sendMessage(phone, "❌ Booking cancelled. Type 'start' to begin a new booking.");
+      return;
+    }
+    
+    const date = booking.meta?.confirmDate;
+    const timeRange = booking.meta?.confirmTime;
+    
+    if (!date || !timeRange) {
+      await sendMessage(phone, '❌ Session expired. Please type "start" to begin again.');
+      return;
+    }
+    
+    const [startTime, endTime] = timeRange.split('-');
+    const sport = booking.meta.selectedSport === 'pickleball' ? 'Pickleball' : 'Paddle';
+    const sportEmoji = booking.meta.selectedSport === 'pickleball' ? '🏓' : '🎾';
+    
+    const locationMap = {
+      'jw': 'JW Marriott',
+      'taj': 'Taj West End',
+      'itc': 'ITC Gardenia'
+    };
+    const location = locationMap[booking.meta.selectedLocation] || booking.meta.selectedLocation;
+    
+    // If payment is pending, block confirmation until webhook marks booking as paid
+    if (booking.step === 'payment_pending' && !booking.paid) {
+      const paymentUrl = booking.meta?.razorpay?.paymentLinkUrl;
+      const amount = booking.meta?.price || Number(process.env.DEFAULT_BOOKING_AMOUNT) || 300;
+      const body = `🔒 Payment required to confirm booking.\nAmount: ₹${amount}\nPlease complete payment and wait for confirmation.`;
+      try {
+        if (paymentUrl) {
+          await sendUrlButtonMessage(phone, body, paymentUrl, 'Pay Now');
+        } else {
+          await sendMessage(phone, `${body}\nWe couldn't find a payment link. Please try slot selection again or contact support.`);
+        }
+      } catch (e) {
+        console.warn('Failed to send payment reminder button:', e?.message || e);
+        if (paymentUrl) await sendMessage(phone, `${body}\n${paymentUrl}`);
+      }
+      return;
+    }
+    
+    // Try to create Google Calendar event
+    let calendarCreated = false;
+    try {
+      await createEvent({
+        dateISO: date,
+        slot: timeRange,
+        summary: `${sport} Court Booking`,
+        description: `${sport} court booking via WhatsApp by ${phone}`,
+        timezone: process.env.GOOGLE_DEFAULT_TIMEZONE || 'Asia/Kolkata'
+      });
+      calendarCreated = true;
+    } catch (error) {
+      console.error('⚠️ Failed to create calendar event:', error.message);
+      // Continue with booking even if calendar creation fails
+    }
+    
+    // Send confirmation message
+    const slotDate = new Date(date);
+    const formattedDate = slotDate.toLocaleDateString('en-US', { 
+      weekday: 'long', 
+      year: 'numeric', 
+      month: 'long', 
+      day: 'numeric' 
+    });
+    
+    const calendarNote = calendarCreated 
+      ? '\n📆 Calendar event created!' 
+      : '\n⚠️ Note: Calendar sync unavailable';
+    
+    await sendMessage(
+      phone,
+      `✅ Booking Confirmed!\n\n${sportEmoji} ${sport}\n📍 ${location}\n📅 ${formattedDate}\n🕒 ${timeRange}${calendarNote}\n\nSee you at the court! 🎉`
+    );
+    
+    // Reset booking state
+    await Booking.deleteOne({ phone });
+    
+  } catch (error) {
+    console.error('Booking confirmation error:', error);
+    await sendMessage(phone, '❌ Failed to confirm booking. Please try again.');
+  }
+}
 
 export default router;

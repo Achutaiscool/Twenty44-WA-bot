@@ -81,10 +81,40 @@ console.warn("⚠️ MONGO_URI not set and DB_* parts incomplete — DB features
 if (!mongoConnectUri) {
 console.warn("⚠️ MongoDB connection URI not available — DB features disabled.");
 } else {
-mongoose
-.connect(mongoConnectUri, { dbName: DB_NAME || "booking_bot" })
-.then(() => console.log("✅ MongoDB connected to database:", DB_NAME || "booking_bot"))
-.catch((err) => console.error("MongoDB error:", err));
+  // Configure mongoose connection
+  const mongooseOptions = {
+    dbName: DB_NAME || "booking_bot",
+    serverSelectionTimeoutMS: 5000, // Timeout after 5s instead of 10s
+    socketTimeoutMS: 45000, // Close sockets after 45s of inactivity
+    family: 4, // Use IPv4, skip trying IPv6
+    retryWrites: true,
+    w: 'majority'
+  };
+
+  // Function to connect with retry logic
+  const connectWithRetry = () => {
+    console.log('Attempting MongoDB connection...');
+    mongoose.connect(mongoConnectUri, mongooseOptions)
+      .then(() => console.log("✅ MongoDB connected to database:", DB_NAME || "booking_bot"))
+      .catch(err => {
+        console.error('MongoDB connection error:', err.message);
+        console.log('Retrying connection in 5 seconds...');
+        setTimeout(connectWithRetry, 5000);
+      });
+  };
+
+  // Handle connection events
+  mongoose.connection.on('error', err => {
+    console.error('MongoDB connection error:', err);
+  });
+
+  mongoose.connection.on('disconnected', () => {
+    console.log('MongoDB disconnected. Attempting to reconnect...');
+    connectWithRetry();
+  });
+
+  // Initial connection
+  connectWithRetry();
 }
 
 

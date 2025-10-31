@@ -51,6 +51,29 @@ export const sendButtonsMessage = async (to, body, buttons) => {
   return sendApi(payload);
 };
 
+// Send an interactive message with a single URL button (call-to-action)
+export const sendUrlButtonMessage = async (to, body, url, title = 'Pay Now') => {
+  const payload = {
+    messaging_product: "whatsapp",
+    to,
+    type: "interactive",
+    interactive: {
+      type: "button",
+      body: { text: body },
+      action: {
+        buttons: [
+          {
+            type: "url",
+            url,
+            title,
+          },
+        ],
+      },
+    },
+  };
+  return sendApi(payload);
+};
+
 export const sendListMessage = async (to, headerText, sections) => {
   const payload = {
     messaging_product: "whatsapp",
@@ -59,9 +82,8 @@ export const sendListMessage = async (to, headerText, sections) => {
     interactive: {
       type: "list",
       header: { type: "text", text: headerText },
-      body: { text: "Please choose an option" },
-      footer: { text: "You can reply with the option number too." },
-      action: { button: "Choose", sections },
+      body: { text: "Please select from the list below" },
+      action: { button: "View Options", sections },
     },
   };
   return sendApi(payload);
