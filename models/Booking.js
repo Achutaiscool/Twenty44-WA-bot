@@ -9,9 +9,11 @@ const bookingSchema = new mongoose.Schema(
     centre: String,
     date: String, // YYYY-MM-DD
     time_slot: String, // e.g. "11:00 - 12:00"
-    players: Number,
-    addons: [String],
-    name: String,
+    name: { type: String, required: true },
+    additionalServices: [{
+      name: String,
+      price: Number
+    }],
     paid: { type: Boolean, default: false },
     calendarEventId: String,
     totalAmount: Number,
